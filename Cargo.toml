@@ -1,0 +1,8 @@
+[workspace]
+
+members = [
+    "iris",
+    "iris-integration-test",
+    "seccomp-sys",
+]
+

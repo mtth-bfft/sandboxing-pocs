@@ -1,0 +1,17 @@
+[package]
+name = "iris-integration-test"
+version = "0.1.0"
+authors = ["Matthieu Buffet <matthieu@buffet.re>"]
+edition = "2018"
+
+[dependencies]
+iris = { path = "../iris" }
+
+[[bin]]
+name = "spawn_worker"
+path = "src/spawn_worker.rs"
+
+[[bin]]
+name = "cannot_open_file_worker"
+path = "src/cannot_open_file_worker.rs"
+
