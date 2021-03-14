@@ -1,15 +1,28 @@
 use std::io::Error;
 use std::thread;
 use std::ffi::CString;
+use std::collections::VecDeque;
 use libc::{c_void, c_int};
 use core::ptr::null;
 use std::os::unix::net::UnixStream;
 use std::os::unix::io::{AsRawFd, IntoRawFd};
 use seccomp_sys::{seccomp_init, seccomp_attr_set, seccomp_syscall_resolve_name, seccomp_rule_add, seccomp_load, seccomp_release, scmp_filter_attr, __NR_SCMP_ERROR, SCMP_ACT_ALLOW, SCMP_ACT_TRAP};
+use serde::{Serialize, Deserialize};
+use bincode::Options;
 
 pub mod broker_sock;
 
 use crate::broker_sock::libiris_get_broker_socket;
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+enum IrisRequest {
+    DontTrustMeAnymore,
+}
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+enum IrisResponse {
+    YouAreNotTrustworthyAnymore,
+    UnexpectedRequest,
+}
 
 // Name of the environment variable used to pass the socket file descriptor number
 // from brokers to workers.
@@ -36,8 +49,10 @@ const DEFAULT_WORKER_STACK_SIZE: usize = 1 * 1024 * 1024;
 pub struct IrisWorker {
     // ID of the worker process
     pid: u64,
+    // Stack on which the initial worker thread executes
+    initial_thread_stack: Vec<u8>,
     // Handle to the thread which waits for the child process to exit
-    reaper_handle: Option<std::thread::JoinHandle<()>>,
+    manager_thread_handle: Option<std::thread::JoinHandle<Result<(), String>>>,
 }
 
 struct IrisWorkerParam {
@@ -49,29 +64,36 @@ struct IrisWorkerParam {
 
 impl Drop for IrisWorker {
     fn drop(&mut self) {
-        println!(" [.] Worker object dropped");
-        self.wait_for_exit();
+        if !self.has_exited() {
+            panic!("IrisWorker dropped out of scope without proper error handling through wait_for_exit()");
+        }
     }
 }
 
 impl IrisWorker {
     pub fn wait_for_exit(&mut self) -> Result<(), String> {
-        if let Some(handle) = self.reaper_handle.take() {
-            if let Err(e) = handle.join() {
-                return Err(format!(" [!] Worker's reaper thread exited with error: {:?}", e));
+        if let Some(handle) = self.manager_thread_handle.take() {
+            println!(" [.] Waiting for manager thread to exit");
+            match handle.join() {
+                Ok(Ok(())) => (),
+                Ok(Err(e)) => return Err(format!("Manager thread exited with error: {}", e)),
+                Err(e) => return Err(format!("Error while waiting for manager thread to exit: {:?}", e)),
             }
+        }
+        else {
+            println!(" [.] Manager thread already exited");
         }
         Ok(())
     }
     pub fn has_exited(&self) -> bool {
-        self.reaper_handle.is_none()
+        self.manager_thread_handle.is_none()
     }
 }
 
 extern "C" fn worker_entrypoint(arg: *mut c_void) -> c_int
 {
     // Cast the argument back to the boxed IrisWorkerParam it was.
-    // worker_entrypoint() must only be used by libiris_worker_new() which ensures this is indeed a &IrisWorkerParam.
+    // worker_entrypoint() must only be used by libiris_worker_new() so it is safe to take ownership here.
     let arg = unsafe { Box::from_raw(arg as *mut IrisWorkerParam) };
     println!(" [.] Worker {} started with PID={}", &arg.exe, unsafe { libc::getpid() });
 
@@ -109,8 +131,7 @@ extern "C" fn worker_entrypoint(arg: *mut c_void) -> c_int
     let envp: Vec<*const i8> = envp.iter().map(|x| x.as_ptr() as *const i8).chain(vec![socket_env_var.as_ptr(), null()]).collect();
 
     unsafe { libc::execve(exe.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
-    println!(" [!] Worker execve() failed: {}", Error::last_os_error());
-    0
+    panic!(" [!] Worker execve({:?}) failed: {}", exe, Error::last_os_error());
 }
 
 pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<IrisWorker, String>
@@ -119,7 +140,7 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
         return Err("Invalid argument passed to libiris_worker_new(): empty argv".to_owned());
     }
 
-    println!(" [.] Creating worker");
+    println!(" [.] Creating worker from PID={}", std::process::id());
 
     // Allocate a stack for the child to execute on
     let mut stack = vec![0; DEFAULT_WORKER_STACK_SIZE];
@@ -130,10 +151,15 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
         Ok((s1, s2)) => (s1, s2),
         Err(e) => return Err(format!("Could not create Unix socket pair: {}", e)),
     };
-    // Mark our end of the socket as CLOEXEC right away so it doesn't leak to our children
-    let res = unsafe { libc::fcntl(broker_socket.as_raw_fd(), libc::F_SETFD, libc::O_CLOEXEC) };
+    // Our end of the socket will be flagged CLOEXEC by default, but we don't want the other
+    // end to be closed.
+    let flags = unsafe { libc::fcntl(child_socket.as_raw_fd(), libc::F_SETFD, libc::O_CLOEXEC) };
+    if flags == -1 {
+        return Err(format!("fcntl(child_socket, F_GETFD) failed with error {}", Error::last_os_error()));
+    }
+    let res = unsafe { libc::fcntl(child_socket.as_raw_fd(), libc::F_SETFD, flags & !(libc::O_CLOEXEC)) };
     if res != 0 {
-        return Err(format!("fcntl(broker_socket, F_SETFD, O_CLOEXEC) failed with error {}", Error::last_os_error()));
+        return Err(format!("fcntl(broker_socket, F_SETFD, ~O_CLOEXEC) failed with error {}", Error::last_os_error()));
     }
 
     let worker_param = IrisWorkerParam {
@@ -159,7 +185,8 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
     }
     println!(" [.] Worker created with PID={}", pid);
 
-    // Close our child's part of the socketpair, which we won't use and would otherwise keep the socket opened even after our child dies
+    // Free resources sent to the child process (e.g. close our child's part of the socketpair, which we
+    // won't use and would otherwise keep the socket opened even after our child dies)
     let worker_param = unsafe { Box::from_raw(worker_param) };
     std::mem::drop(worker_param);
 
@@ -167,7 +194,39 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
     // TODO: ensure sandboxed children don't have the (theoretical) right to ptrace() each others (if seccomp fails). Otherwise, prctl(undumpable) like chromium.
     // TODO: rlimit for number of file descriptors?
 
-    let reaper_handle = thread::spawn(move || {
+    let manager_thread_builder = thread::Builder::new().name(format!("iris_{}_manager", pid)).stack_size(32 * 1024);
+    let manager_thread_handle = manager_thread_builder.spawn(move || -> Result<(), String> {
+        let jobs: VecDeque<IrisRequest> = VecDeque::new();
+        let bincode_options = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(1*1024*1024);
+        match bincode_options.deserialize_from(&broker_socket) {
+            Ok(IrisRequest::DontTrustMeAnymore) => (),
+            other => return Err(format!("Failed to deserialize initial request from socket: {:?} , did the worker exit before calling libiris_dont_trust_me_anymore() ?", other)),
+        };
+        if let Err(e) = bincode_options.serialize_into(&broker_socket, &IrisResponse::YouAreNotTrustworthyAnymore) {
+            panic!("Failed to serialize response into socket: {:?}", e);
+        }
+        loop {
+            let request: IrisRequest = match bincode_options.deserialize_from(&broker_socket) {
+                Ok(request) => request,
+                Err(e) => match *e {
+                    bincode::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    _ => panic!("Failed to deserialize request from socket: {:?}", e),
+                },
+            };
+            println!(" [.] Received request: {:?}", request);
+            let response = match request {
+                _ => {
+                    println!(" [!] Discarding unexpected request from worker: {:?}", request);
+                    IrisResponse::UnexpectedRequest
+                },
+            };
+            if let Err(e) = bincode_options.serialize_into(&broker_socket, &response) {
+                panic!("Failed to serialize response into socket: {:?}", e);
+            }
+        }
+        println!(" [.] Worker closed its side of the communication socket, waiting for it to die...");
         let mut status: c_int = 0;
         let res = unsafe { libc::waitpid(pid, &mut status as *mut c_int, libc::__WALL) };
         // Ignore ECHILD errors which can occur if the child exits right away before waitpid() starts
@@ -176,17 +235,22 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
                 println!(" [.] Process probably exited, waitpid() gave ECHILD in parent");
             }
             else {
-                println!(" [!] Reaper thread failed to wait on PID={} (error {})", pid, std::io::Error::last_os_error());
-                return; // leak the child process memory and reaper thread on purpose, better than a crash
+                panic!(" [!] Manager thread failed to wait on PID={} (error {})", pid, std::io::Error::last_os_error());
             }
         }
-        std::mem::drop(stack);
         println!(" [.] Worker reaped successfully");
+        Ok(())
     });
+    
+    let manager_thread_handle = match manager_thread_handle {
+        Ok(handle) => handle,
+        Err(e) => return Err(format!("Unable to spawn thread to manage the worker's lifetime: {}", e)),
+    };
     
     Ok(IrisWorker {
         pid: pid as u64,
-        reaper_handle: Some(reaper_handle),
+        initial_thread_stack: stack,
+        manager_thread_handle: Some(manager_thread_handle),
     })
 }
 
@@ -219,14 +283,25 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
     //}
 
     let sock = libiris_get_broker_socket().unwrap();
+    // FIXME: parse the request, normalize it, serialize it, send it, replace context with the response
 }
-
 
 pub fn libiris_dont_trust_me_anymore() -> Result<(), String>
 {
-    let sock = match libiris_get_broker_socket() {
+    let mut sock = match libiris_get_broker_socket() {
         Some(s) => s,
         None => return Err("Could not find broker communication socket in environment variables, is this really a sandboxed process?".to_owned()),
+    };
+    let bincode_options = bincode::DefaultOptions::new().with_fixint_encoding();
+    let request = IrisRequest::DontTrustMeAnymore;
+    if let Err(e) = bincode_options.serialize_into(sock, &request) {
+        panic!("Failed to serialize initial message into broker socket: {}", e);
+    }
+    println!(" [+] Worker sent {:?}", &request);
+
+    match bincode_options.deserialize_from(sock) {
+        Ok(IrisResponse::YouAreNotTrustworthyAnymore) => (),
+        other => panic!("Failed to deserialize initial response from broker socket: {:?}", other),
     };
 
     let mut empty_signal_set: libc::sigset_t = unsafe { std::mem::zeroed() };

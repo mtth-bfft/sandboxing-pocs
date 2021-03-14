@@ -8,10 +8,14 @@ edition = "2018"
 iris = { path = "../iris" }
 
 [[bin]]
-name = "spawn_worker"
-path = "src/spawn_worker.rs"
+name = "01_spawn_worker"
+path = "src/01_spawn_worker.rs"
 
 [[bin]]
-name = "cannot_open_file_worker"
-path = "src/cannot_open_file_worker.rs"
+name = "02_forgetting_wait_panics_worker"
+path = "src/02_forgetting_wait_panics_worker.rs"
+
+[[bin]]
+name = "03_forgetting_lockdown_returns_error_worker"
+path = "src/03_forgetting_lockdown_returns_error_worker.rs"
 
