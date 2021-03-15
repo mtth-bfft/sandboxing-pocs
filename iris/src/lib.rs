@@ -330,18 +330,6 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
     let ucontext = ucontext as *mut libc::ucontext_t;
     let syscall_nr = unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] };
 
-    // sigaction() was passed SA_NODEFER so that SIGSYS is not masked when this
-    // handler is called to handle a first SIGSYS. The only way a thread-directed
-    // SIGSYS is received while this handler is running is if the handler tries to
-    // perform a non-systematically approved syscall, which is a permanent failure
-    // we want to catch early. Detect reentrancy using SIGSYS_HANDLER_ALREADY_RUNNING
-    // and panic if it happens.
-    SIGSYS_HANDLER_ALREADY_RUNNING.with(|b| {
-        if b.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst) != Ok(false) {
-            panic!("Syscall handler tried to use syscall {} which is not automatically approved, please consider opening an issue", syscall_nr);
-        }
-    });
-
     // /!\ Memory / print are unsafe in syscall handler, just for debugging purposes here
     let msg = format!(" [.] Syscall nr={} tried, needs broker proxying\n", syscall_nr);
     unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
@@ -367,9 +355,6 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
             unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = -(libc::EPERM as i64); }
         }
     }
-    SIGSYS_HANDLER_ALREADY_RUNNING.with(|b| {
-        b.store(false, Ordering::SeqCst);
-    });
 }
 
 pub fn libiris_dont_trust_me_anymore() -> Result<(), String>
@@ -393,7 +378,7 @@ pub fn libiris_dont_trust_me_anymore() -> Result<(), String>
     let new_sigaction = libc::sigaction {
         sa_sigaction: sigsys_handler as usize,
         sa_mask: empty_signal_set,
-        sa_flags: libc::SA_SIGINFO | libc::SA_NODEFER,
+        sa_flags: libc::SA_SIGINFO,
         sa_restorer: None,
     };
     let mut old_sigaction: libc::sigaction = unsafe { std::mem::zeroed() };
