@@ -1,7 +1,8 @@
 use std::io::Error;
 use std::thread;
-use std::ffi::CString;
+use std::ffi::{CString, CStr};
 use std::collections::VecDeque;
+use core::sync::atomic::{AtomicBool, Ordering};
 use libc::{c_void, c_int};
 use core::ptr::null;
 use std::os::unix::net::UnixStream;
@@ -17,18 +18,20 @@ use crate::broker_sock::libiris_get_broker_socket;
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 enum IrisRequest {
     DontTrustMeAnymore,
+    OpenFile { path: Vec<u8>, readonly: bool },
 }
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 enum IrisResponse {
     YouAreNotTrustworthyAnymore,
     UnexpectedRequest,
+    DeniedByPolicy,
 }
 
 // Name of the environment variable used to pass the socket file descriptor number
 // from brokers to workers.
 const LIBIRIS_SOCKET_FD_ENV_NAME: &str = "IRIS_SOCK_FD";
 
-const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 8] = [
+const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 12] = [
     "read",
     "write",
     "readv",
@@ -36,7 +39,11 @@ const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 8] = [
     "close",
     "sigaltstack",
     "munmap",
+    "nanosleep",
     "exit_group",
+    "restart_syscall",
+    "rt_sigreturn",
+    "rt_sigaction", // FIXME: should really be handled separately, to hook rt_sigaction(SIGSYS,..)
 ];
 const DEFAULT_WORKER_STACK_SIZE: usize = 1 * 1024 * 1024;
 
@@ -98,6 +105,7 @@ extern "C" fn worker_entrypoint(arg: *mut c_void) -> c_int
     let arg = unsafe { Box::from_raw(arg as *mut IrisWorkerParam) };
     println!(" [.] Worker {} started with PID={}", &arg.exe, unsafe { libc::getpid() });
 
+    // TODO: move all this processing in libiris_worker_new(), where we can report the error correctly and instantly to the caller
     let exe = match CString::new(arg.exe.to_owned()) {
         Ok(s) => s,
         _ => {
@@ -230,7 +238,6 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
 
     // TODO: if CLONE_NEWNS failed and CAP_SYS_CHROOT is held, chroot to an empty directory
     // TODO: ensure sandboxed children don't have the (theoretical) right to ptrace() each others (if seccomp fails). Otherwise, prctl(undumpable) like chromium.
-    // TODO: rlimit for number of file descriptors?
 
     let manager_thread_builder = thread::Builder::new().name(format!("iris_{}_manager", pid)).stack_size(32 * 1024);
     let manager_thread_handle = manager_thread_builder.spawn(move || -> Result<(), String> {
@@ -252,6 +259,9 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
             };
             println!(" [.] Received request: {:?}", request);
             let response = match request {
+                IrisRequest::OpenFile { path, readonly } => {
+                    panic!("Not implemented: {:?}", path);
+                },
                 _ => {
                     println!(" [!] Discarding unexpected request from worker: {:?}", request);
                     IrisResponse::UnexpectedRequest
@@ -273,7 +283,13 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
                 panic!("Manager thread failed to wait on PID={} (error {})", pid, std::io::Error::last_os_error());
             }
         }
-        println!(" [.] Worker reaped successfully");
+        if libc::WIFEXITED(status) {
+            println!(" [.] Worker reaped successfully, exited with code {}", libc::WEXITSTATUS(status));
+        } else if libc::WIFSIGNALED(status) {
+            println!(" [.] Worker reaped successfully, killed by signal {}", libc::WTERMSIG(status));
+        } else {
+            println!(" [.] Worker reaped successfully, unknown exit reason (status {})", status);
+        }
         Ok(())
     });
     
@@ -299,6 +315,8 @@ fn get_syscall_number(name: &str) -> Result<i32, String>
     Ok(nr)
 }
 
+thread_local!(static SIGSYS_HANDLER_ALREADY_RUNNING: AtomicBool = AtomicBool::new(false));
+
 extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, ucontext: *const c_void)
 {
     if signal_no != libc::SIGSYS {
@@ -308,22 +326,55 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
     if siginfo.si_code != 1 { // SYS_SECCOMP
         return;
     }
-    let ucontext = unsafe { *(ucontext as *const libc::ucontext_t) };
-    // /!\ Unsafe in syscall handler
-    let msg = format!(" [.] Syscall handler called: rax={} ", ucontext.uc_mcontext.gregs[libc::REG_RAX as usize]);
+    
+    let ucontext = ucontext as *mut libc::ucontext_t;
+    let syscall_nr = unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] };
+
+    // sigaction() was passed SA_NODEFER so that SIGSYS is not masked when this
+    // handler is called to handle a first SIGSYS. The only way a thread-directed
+    // SIGSYS is received while this handler is running is if the handler tries to
+    // perform a non-systematically approved syscall, which is a permanent failure
+    // we want to catch early. Detect reentrancy using SIGSYS_HANDLER_ALREADY_RUNNING
+    // and panic if it happens.
+    SIGSYS_HANDLER_ALREADY_RUNNING.with(|b| {
+        if b.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst) != Ok(false) {
+            panic!("Syscall handler tried to use syscall {} which is not automatically approved, please consider opening an issue", syscall_nr);
+        }
+    });
+
+    // /!\ Memory / print are unsafe in syscall handler, just for debugging purposes here
+    let msg = format!(" [.] Syscall nr={} tried, needs broker proxying\n", syscall_nr);
     unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
 
-    //if ucontext.uc_mcontext.gregs[libc::REG_RAX as usize] == libc::SYS_open {
-        
-    //}
-
     let sock = libiris_get_broker_socket().unwrap();
-    // FIXME: parse the request, normalize it, serialize it, send it, replace context with the response
+
+    match syscall_nr {
+        libc::SYS_openat => {
+            let path = unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RSI as usize] };
+            let path = unsafe { CStr::from_ptr(path as *const libc::c_char) }.to_owned();
+            println!(" [+] Requested access to file path {:?}", path);
+            let request = IrisRequest::OpenFile {
+                path: path.to_bytes().to_owned(),
+                readonly: true,
+            };
+            let bincode_options = bincode::DefaultOptions::new().with_fixint_encoding();
+            if let Err(e) = bincode_options.serialize_into(sock, &request) {
+                panic!("Failed to serialize file open request into socket: {:?}", e);
+            }
+            unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = 2; }
+        }
+        _ => {
+            unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = -(libc::EPERM as i64); }
+        }
+    }
+    SIGSYS_HANDLER_ALREADY_RUNNING.with(|b| {
+        b.store(false, Ordering::SeqCst);
+    });
 }
 
 pub fn libiris_dont_trust_me_anymore() -> Result<(), String>
 {
-    let mut sock = match libiris_get_broker_socket() {
+    let sock = match libiris_get_broker_socket() {
         Some(s) => s,
         None => return Err("Could not find broker communication socket in environment variables, is this really a sandboxed process?".to_owned()),
     };
@@ -342,7 +393,7 @@ pub fn libiris_dont_trust_me_anymore() -> Result<(), String>
     let new_sigaction = libc::sigaction {
         sa_sigaction: sigsys_handler as usize,
         sa_mask: empty_signal_set,
-        sa_flags: libc::SA_SIGINFO,
+        sa_flags: libc::SA_SIGINFO | libc::SA_NODEFER,
         sa_restorer: None,
     };
     let mut old_sigaction: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -371,6 +422,7 @@ pub fn libiris_dont_trust_me_anymore() -> Result<(), String>
 
     for syscall_name in &SYSCALLS_ALLOWED_BY_DEFAULT {
         let syscall_nr = get_syscall_number(&syscall_name).unwrap();
+        println!(" [.] Allowing syscall {} / {}", syscall_name, syscall_nr);
         let res = unsafe { seccomp_rule_add(filter, SCMP_ACT_ALLOW, syscall_nr, 0) };
         if res != 0 {
             println!(" [!] seccomp_rule_add(SCMP_ACT_ALLOW, {}) failed with code {}", syscall_name, -res);

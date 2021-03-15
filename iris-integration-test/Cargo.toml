@@ -6,6 +6,7 @@ edition = "2018"
 
 [dependencies]
 iris = { path = "../iris" }
+libc = "0.2"
 
 [[bin]]
 name = "01_spawn_worker"
@@ -18,4 +19,8 @@ path = "src/02_forgetting_wait_panics_worker.rs"
 [[bin]]
 name = "03_forgetting_lockdown_returns_error_worker"
 path = "src/03_forgetting_lockdown_returns_error_worker.rs"
+
+[[bin]]
+name = "05_opening_allowed_file_succeeds_worker"
+path = "src/05_opening_allowed_file_succeeds_worker.rs"
 
