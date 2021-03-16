@@ -20,12 +20,14 @@ use crate::unix_sockets::UnixSocket;
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 enum IrisRequest {
     DontTrustMeAnymore,
+    // path must be a non-null terminated UTF-8 valid string
     OpenFile { path: Vec<u8>, readonly: bool },
 }
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 enum IrisResponse {
     YouAreNotTrustworthyAnymore,
     UnexpectedRequest,
+    ReturnCode(usize),
     DeniedByPolicy,
 }
 
@@ -274,20 +276,35 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
                 Err(e) => return Err(format!("Failed to deserialize request from worker: {}", e)),
             };
             println!(" [.] Received request from worker: {:?}", request);
-            let response = match request {
+            let (response, fd) = match request {
                 IrisRequest::OpenFile { path, readonly } => {
-                    panic!("Not implemented: {:?}", path);
+                    let path_nul = match CString::new(path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            println!(" [!] Worker requested open() of invalid path ({}), probably malicious", e);
+                            break;
+                        },
+                    };
+                    let perms = if readonly { libc::O_RDONLY } else { libc::O_RDWR };
+                    let res = unsafe { libc::open(path_nul.as_ptr(), perms | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0) };
+                    if res < 0 {
+                        println!(" [!] Worker requested open({:?}) which failed with error {}", path_nul, res);
+                        (IrisResponse::ReturnCode(res.try_into().unwrap()), None)
+                    }
+                    else {
+                        (IrisResponse::ReturnCode(0), Some(res))
+                    }
                 },
                 _ => {
                     println!(" [!] Discarding unexpected request from worker: {:?}", request);
-                    IrisResponse::UnexpectedRequest
+                    (IrisResponse::UnexpectedRequest, None)
                 },
             };
-            let response = match bincode_options.serialize(&response) {
+            let bytes = match bincode_options.serialize(&response) {
                 Ok(bytes) => bytes,
                 Err(e) => return Err(format!("Failed to serialize response for worker: {}", e)),
             };
-            if let Err(e) = broker_request_socket.sendmsg_with_fd(&response, None) {
+            if let Err(e) = broker_request_socket.sendmsg_with_fd(&bytes, fd) {
                 return Err(format!("Failed to send response to worker: {}", e));
             }
         }
@@ -353,10 +370,14 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
                 Ok(bytes) => bytes,
                 Err(e) => panic!("Failed to serialize syscall request into socket: {:?}", e),
             };
-            if let Err(e) = sock.sendmsg_with_fd(&bytes, None) {
-                panic!("Failed to send syscall request to broker: {:?}", e);
-            }
-            unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = 2; }
+            sock.sendmsg_with_fd(&bytes, None).expect("Failed to send syscall request to broker");
+            let (bytes, fd) = sock.recvmsg_with_fd().expect("Failed to read response from broker");
+            let return_code = match (bincode_options.deserialize(&bytes), fd) {
+                (Ok(IrisResponse::ReturnCode(0)), Some(fd)) => fd as i64,
+                (Ok(IrisResponse::ReturnCode(n)), None) => -(n as i64),
+                err => panic!("Failed to deserialize syscall response: {:?}", err),
+            };
+            unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = return_code; }
         }
         _ => {
             unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = -(libc::EPERM as i64); }
