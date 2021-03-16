@@ -2,18 +2,20 @@ use std::io::Error;
 use std::thread;
 use std::ffi::{CString, CStr};
 use std::collections::VecDeque;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::AtomicBool;
 use libc::{c_void, c_int};
 use core::ptr::null;
-use std::os::unix::net::UnixStream;
-use std::os::unix::io::{AsRawFd, IntoRawFd};
 use seccomp_sys::{seccomp_init, seccomp_attr_set, seccomp_syscall_resolve_name, seccomp_rule_add, seccomp_load, seccomp_release, scmp_filter_attr, __NR_SCMP_ERROR, SCMP_ACT_ALLOW, SCMP_ACT_TRAP};
 use serde::{Serialize, Deserialize};
 use bincode::Options;
+use std::os::unix::io::AsRawFd;
+use std::convert::TryInto;
 
 pub mod broker_sock;
+mod unix_sockets;
 
 use crate::broker_sock::libiris_get_broker_socket;
+use crate::unix_sockets::UnixSocket;
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 enum IrisRequest {
@@ -31,11 +33,17 @@ enum IrisResponse {
 // from brokers to workers.
 const LIBIRIS_SOCKET_FD_ENV_NAME: &str = "IRIS_SOCK_FD";
 
-const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 12] = [
+// Maximum number of bytes in a single IPC message (request/response to or from a broker)
+// Chosen to fit MAX_PATH (260 * sizeof(WCHAR)) on Windows + serialization headers.
+const LIBIRIS_IPC_MESSAGE_MAX_SIZE: usize = 1024;
+
+const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 14] = [
     "read",
     "write",
     "readv",
     "writev",
+    "recvmsg",
+    "sendmsg",
     "close",
     "sigaltstack",
     "munmap",
@@ -60,14 +68,16 @@ pub struct IrisWorker {
     initial_thread_stack: Vec<u8>,
     // Handle to the thread which waits for the child process to exit
     manager_thread_handle: Option<std::thread::JoinHandle<Result<(), String>>>,
+    // Option filled the first time a wait_for_exit() is called and succeeds
+    exit_code: Option<i32>,
 }
 
 struct IrisWorkerParam {
     exe: String,
     argv: Vec<String>,
     envp: Vec<String>,
-    request_socket: std::os::unix::net::UnixStream,
-    execve_socket: std::os::unix::net::UnixStream,
+    request_socket: UnixSocket,
+    execve_socket: UnixSocket,
 }
 
 impl Drop for IrisWorker {
@@ -87,6 +97,26 @@ impl IrisWorker {
                 Ok(Err(e)) => return Err(format!("Manager thread exited with error: {}", e)),
                 Err(e) => return Err(format!("Error while waiting for manager thread to exit: {:?}", e)),
             }
+            let mut status: c_int = 0;
+            let pid: i32 = self.pid.try_into().unwrap();
+            let res = unsafe { libc::waitpid(pid, &mut status as *mut c_int, libc::__WALL) };
+            // Ignore ECHILD errors which can occur if the child exits right away before waitpid() starts
+            if res != pid {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                    return Err("Failed to wait for worker process to exit, another thread in the application already called wait() or waitpid()".to_owned());
+                }
+                return Err(format!("Failed to wait for worker PID={} to exit: {}", pid, std::io::Error::last_os_error()));
+            }
+            if libc::WIFEXITED(status) {
+                println!(" [.] Worker reaped successfully, exited with code {}", libc::WEXITSTATUS(status));
+                self.exit_code = Some(libc::WEXITSTATUS(status));
+            } else if libc::WIFSIGNALED(status) {
+                println!(" [.] Worker reaped successfully, killed by signal {}", libc::WTERMSIG(status));
+                self.exit_code = Some(libc::WTERMSIG(status));
+            } else {
+                println!(" [.] Worker reaped successfully, unknown exit reason (status {})", status);
+                self.exit_code = Some(status);
+            }
         }
         else {
             println!(" [.] Manager thread already exited");
@@ -94,7 +124,10 @@ impl IrisWorker {
         Ok(())
     }
     pub fn has_exited(&self) -> bool {
-        self.manager_thread_handle.is_none()
+        self.manager_thread_handle.is_none() || self.exit_code.is_some()
+    }
+    pub fn get_exit_code(&self) -> Option<i32> {
+        self.exit_code
     }
 }
 
@@ -102,7 +135,7 @@ extern "C" fn worker_entrypoint(arg: *mut c_void) -> c_int
 {
     // Cast the argument back to the boxed IrisWorkerParam it was.
     // worker_entrypoint() must only be used by libiris_worker_new() so it is safe to take ownership here.
-    let arg = unsafe { Box::from_raw(arg as *mut IrisWorkerParam) };
+    let mut arg = unsafe { Box::from_raw(arg as *mut IrisWorkerParam) };
     println!(" [.] Worker {} started with PID={}", &arg.exe, unsafe { libc::getpid() });
 
     // TODO: move all this processing in libiris_worker_new(), where we can report the error correctly and instantly to the caller
@@ -135,46 +168,19 @@ extern "C" fn worker_entrypoint(arg: *mut c_void) -> c_int
         };
     }
     // This voluntarily leaks the socket file descriptor, so it is preserved across execve()
-    let request_socket_fd = arg.request_socket.into_raw_fd();
+    let request_socket_fd = arg.request_socket.as_raw_fd();
     let request_socket_env_var = CString::new(format!("{}={}", LIBIRIS_SOCKET_FD_ENV_NAME, request_socket_fd)).unwrap();
     let envp: Vec<*const i8> = envp.iter().map(|x| x.as_ptr() as *const i8).chain(vec![request_socket_env_var.as_ptr(), null()]).collect();
-
+    
     unsafe { libc::execve(exe.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
 
     let execve_errno: i32 = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
     let bincode_options = bincode::DefaultOptions::new().with_fixint_encoding();
-    if let Err(e) = bincode_options.serialize_into(&arg.execve_socket, &execve_errno) {
-        panic!("Failed to propagate execve() error to broker process: {}", e);
-    }
+    let message = bincode_options.serialize(&execve_errno).expect("Failed to serialize execve() error to broker process");
+    arg.execve_socket.sendmsg_with_fd(&message, None).expect("Failed to forward execve() error to broker process");
     execve_errno as c_int
 }
 
-fn alloc_socketpair(child_cloexec: bool) -> Result<(UnixStream, UnixStream), String>
-{
-    let (child_socket, broker_socket) = match UnixStream::pair() {
-        Ok(pair) => pair,
-        Err(e) => return Err(format!("Could not create Unix socket pair: {}", e)),
-    };
-    // Our end of the socket will be flagged CLOEXEC by default, just ensure it really is
-    let flags = unsafe { libc::fcntl(broker_socket.as_raw_fd(), libc::F_GETFD, 0) };
-    if flags == -1 {
-        return Err(format!("fcntl(broker_socket, F_GETFD) failed with error {}", Error::last_os_error()));
-    }
-    let res = unsafe { libc::fcntl(broker_socket.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) };
-    if res != 0 {
-        return Err(format!("fcntl(broker_socket, F_SETFD, FD_CLOEXEC) failed with error {}", Error::last_os_error()));
-    }
-    // Set the child's end as requested
-    let flags = unsafe { libc::fcntl(child_socket.as_raw_fd(), libc::F_GETFD, 0) };
-    if flags == -1 {
-        return Err(format!("fcntl(child_socket, F_GETFD) failed with error {}", Error::last_os_error()));
-    }
-    let res = unsafe { libc::fcntl(child_socket.as_raw_fd(), libc::F_SETFD, if child_cloexec { flags | libc::FD_CLOEXEC } else { flags & !(libc::FD_CLOEXEC) }) };
-    if res != 0 {
-        return Err(format!("fcntl(child_socket, F_SETFD, FD_CLOEXEC={}) failed with error {}", child_cloexec, Error::last_os_error()));
-    }
-    Ok((child_socket, broker_socket))
-}
 
 pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<IrisWorker, String>
 {
@@ -189,9 +195,9 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
     let stack_ptr = stack.as_mut_ptr().wrapping_add(DEFAULT_WORKER_STACK_SIZE) as *mut c_void;
 
     // Allocate a socketpair for the child to send syscall requests to us
-    let (child_request_socket, broker_request_socket) = alloc_socketpair(false)?;
+    let (child_request_socket, mut broker_request_socket) = UnixSocket::new(false)?;
     // Allocate a socketpair to detect any execve() error during worker startup, using CLOEXEC behaviour on these sockets
-    let (child_execve_socket, broker_execve_socket) = alloc_socketpair(true)?;
+    let (child_execve_socket, mut broker_execve_socket) = UnixSocket::new(true)?;
 
     let worker_param = IrisWorkerParam {
         exe: exe.to_owned(),
@@ -221,19 +227,19 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
     // won't write to and would otherwise keep the socket opened even after our child dies)
     let worker_param = unsafe { Box::from_raw(worker_param) };
     std::mem::drop(worker_param);
-
+        
     let bincode_options = bincode::DefaultOptions::new()
         .with_fixint_encoding()
+        .reject_trailing_bytes()
         .with_limit(1*1024*1024);
-    let execve_errcode: Option<i32> = match bincode_options.deserialize_from(&broker_execve_socket) {
-        Ok(errno) => Some(errno),
-        Err(e) => match *e {
-            bincode::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
-            _ => return Err(format!("Worker probably failed to execute, cannot deserialize message from execve socket: {:?}", e)),
-        },
-    };
-    if let Some(errno) = execve_errcode {
-        return Err(format!("execve() failed with error {}", errno));
+
+    if let Ok(bytes) = broker_execve_socket.recvmsg() {
+        if bytes.len() > 0 {
+            match bincode_options.deserialize::<i32>(&bytes) {
+                Ok(errno) => return Err(format!("Worker execve() failed with error {}", errno)),
+                Err(e) => return Err(format!("Worker probably failed to execute, cannot deserialize message from execve socket: {:?}", e)),
+            }
+        }
     }
 
     // TODO: if CLONE_NEWNS failed and CAP_SYS_CHROOT is held, chroot to an empty directory
@@ -242,22 +248,32 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
     let manager_thread_builder = thread::Builder::new().name(format!("iris_{}_manager", pid)).stack_size(32 * 1024);
     let manager_thread_handle = manager_thread_builder.spawn(move || -> Result<(), String> {
         let jobs: VecDeque<IrisRequest> = VecDeque::new();
-        match bincode_options.deserialize_from(&broker_request_socket) {
-            Ok(IrisRequest::DontTrustMeAnymore) => (),
-            other => return Err(format!("Failed to receive initial request from worker: {:?} , did it exit before calling libiris_dont_trust_me_anymore() ?", other)),
+        let message = match broker_request_socket.recvmsg() {
+            Ok(message) => message,
+            Err(e) => return Err(format!("Failed to read initial request from worker: {:?}, did it exit before calling libiris_dont_trust_me_anymore() ?", e)),
         };
-        if let Err(e) = bincode_options.serialize_into(&broker_request_socket, &IrisResponse::YouAreNotTrustworthyAnymore) {
-            panic!("Failed to serialize response into socket: {:?}", e);
+        match bincode_options.deserialize(&message) {
+            Ok(IrisRequest::DontTrustMeAnymore) => (),
+            other => return Err(format!("Failed to deserialize initial request from worker: {:?} , did it exit before calling libiris_dont_trust_me_anymore() ?", other)),
+        };
+        let message = bincode_options.serialize(&IrisResponse::YouAreNotTrustworthyAnymore).expect("Failed to serialize initial response");
+	if let Err(e) = broker_request_socket.sendmsg_with_fd(&message, None) {
+            return Err(format!("Failed to serialize initial response to worker: {:?}, did it exit before calling libiris_dont_trust_me_anymore() ?", e));
         }
         loop {
-            let request: IrisRequest = match bincode_options.deserialize_from(&broker_request_socket) {
-                Ok(request) => request,
-                Err(e) => match *e {
-                    bincode::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    _ => panic!("Failed to deserialize request from socket: {:?}", e),
-                },
+            let bytes = match broker_request_socket.recvmsg() {
+                Ok(bytes) => bytes,
+                Err(e) => return Err(format!("Failed to read request from worker: {}", e)),
             };
-            println!(" [.] Received request: {:?}", request);
+            if bytes.is_empty() {
+                break;
+            }
+            println!(" [+] Received from worker: {:?}", &bytes);
+            let request: IrisRequest = match bincode_options.deserialize(&bytes) {
+                Ok(r) => r,
+                Err(e) => return Err(format!("Failed to deserialize request from worker: {}", e)),
+            };
+            println!(" [.] Received request from worker: {:?}", request);
             let response = match request {
                 IrisRequest::OpenFile { path, readonly } => {
                     panic!("Not implemented: {:?}", path);
@@ -267,29 +283,15 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
                     IrisResponse::UnexpectedRequest
                 },
             };
-            if let Err(e) = bincode_options.serialize_into(&broker_request_socket, &response) {
-                panic!("Failed to serialize response into socket: {:?}", e);
+            let response = match bincode_options.serialize(&response) {
+                Ok(bytes) => bytes,
+                Err(e) => return Err(format!("Failed to serialize response for worker: {}", e)),
+            };
+            if let Err(e) = broker_request_socket.sendmsg_with_fd(&response, None) {
+                return Err(format!("Failed to send response to worker: {}", e));
             }
         }
-        println!(" [.] Worker closed its side of the communication socket, waiting for it to die...");
-        let mut status: c_int = 0;
-        let res = unsafe { libc::waitpid(pid, &mut status as *mut c_int, libc::__WALL) };
-        // Ignore ECHILD errors which can occur if the child exits right away before waitpid() starts
-        if res != pid {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
-                println!(" [.] Process probably exited, waitpid() gave ECHILD in parent");
-            }
-            else {
-                panic!("Manager thread failed to wait on PID={} (error {})", pid, std::io::Error::last_os_error());
-            }
-        }
-        if libc::WIFEXITED(status) {
-            println!(" [.] Worker reaped successfully, exited with code {}", libc::WEXITSTATUS(status));
-        } else if libc::WIFSIGNALED(status) {
-            println!(" [.] Worker reaped successfully, killed by signal {}", libc::WTERMSIG(status));
-        } else {
-            println!(" [.] Worker reaped successfully, unknown exit reason (status {})", status);
-        }
+        println!(" [.] Worker closed its side of the communication socket, manager closing");
         Ok(())
     });
     
@@ -302,6 +304,7 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
         pid: pid as u64,
         initial_thread_stack: stack,
         manager_thread_handle: Some(manager_thread_handle),
+        exit_code: None,
     })
 }
 
@@ -334,20 +337,24 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
     let msg = format!(" [.] Syscall nr={} tried, needs broker proxying\n", syscall_nr);
     unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
 
-    let sock = libiris_get_broker_socket().unwrap();
+    let mut sock = libiris_get_broker_socket().unwrap();
+    let bincode_options = bincode::DefaultOptions::new().with_fixint_encoding();
 
     match syscall_nr {
         libc::SYS_openat => {
             let path = unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RSI as usize] };
             let path = unsafe { CStr::from_ptr(path as *const libc::c_char) }.to_owned();
-            println!(" [+] Requested access to file path {:?}", path);
+            println!(" [.] Requesting access to file path {:?}", path);
             let request = IrisRequest::OpenFile {
                 path: path.to_bytes().to_owned(),
                 readonly: true,
             };
-            let bincode_options = bincode::DefaultOptions::new().with_fixint_encoding();
-            if let Err(e) = bincode_options.serialize_into(sock, &request) {
-                panic!("Failed to serialize file open request into socket: {:?}", e);
+            let bytes = match bincode_options.serialize(&request) {
+                Ok(bytes) => bytes,
+                Err(e) => panic!("Failed to serialize syscall request into socket: {:?}", e),
+            };
+            if let Err(e) = sock.sendmsg_with_fd(&bytes, None) {
+                panic!("Failed to send syscall request to broker: {:?}", e);
             }
             unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = 2; }
         }
@@ -359,16 +366,16 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
 
 pub fn libiris_dont_trust_me_anymore() -> Result<(), String>
 {
-    let sock = match libiris_get_broker_socket() {
+    let mut sock = match libiris_get_broker_socket() {
         Some(s) => s,
         None => return Err("Could not find broker communication socket in environment variables, is this really a sandboxed process?".to_owned()),
     };
     let bincode_options = bincode::DefaultOptions::new().with_fixint_encoding();
-    if let Err(e) = bincode_options.serialize_into(sock, &IrisRequest::DontTrustMeAnymore) {
-        panic!("Failed to serialize initial message to broker into socket: {}", e);
-    }
+    let bytes = bincode_options.serialize(&IrisRequest::DontTrustMeAnymore).expect("Failed to serialize initial message for broker");
+    sock.sendmsg_with_fd(&bytes, None).expect("Failed to send initial message to broker");
 
-    match bincode_options.deserialize_from(sock) {
+    let bytes = sock.recvmsg().expect("Failed to read initial response from broker");
+    match bincode_options.deserialize(&bytes) {
         Ok(IrisResponse::YouAreNotTrustworthyAnymore) => (),
         other => panic!("Failed to deserialize initial response from broker socket: {:?}", other),
     };
@@ -424,4 +431,6 @@ pub fn libiris_dont_trust_me_anymore() -> Result<(), String>
     println!(" [.] Worker ready to handle untrusted data");
     Ok(())
 }
+
+
 
