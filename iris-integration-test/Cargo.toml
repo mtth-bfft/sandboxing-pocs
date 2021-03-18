@@ -21,6 +21,14 @@ name = "03_forgetting_lockdown_returns_error_worker"
 path = "src/03_forgetting_lockdown_returns_error_worker.rs"
 
 [[bin]]
-name = "05_opening_allowed_file_succeeds_worker"
-path = "src/05_opening_allowed_file_succeeds_worker.rs"
+name = "05_get_exit_code_works_after_exit_worker"
+path = "src/05_get_exit_code_works_after_exit_worker.rs"
+
+[[bin]]
+name = "06_get_exit_code_works_after_termination_worker"
+path = "src/06_get_exit_code_works_after_termination_worker.rs"
+
+[[bin]]
+name = "07_opening_allowed_file_succeeds_worker"
+path = "src/07_opening_allowed_file_succeeds_worker.rs"
 

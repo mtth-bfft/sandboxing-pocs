@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use core::sync::atomic::AtomicBool;
 use libc::{c_void, c_int};
 use core::ptr::null;
-use seccomp_sys::{seccomp_init, seccomp_attr_set, seccomp_syscall_resolve_name, seccomp_rule_add, seccomp_load, seccomp_release, scmp_filter_attr, __NR_SCMP_ERROR, SCMP_ACT_ALLOW, SCMP_ACT_TRAP};
+use seccomp_sys::{seccomp_init, seccomp_attr_set, seccomp_syscall_resolve_name, seccomp_rule_add, seccomp_load, seccomp_release, scmp_filter_attr, __NR_SCMP_ERROR, SCMP_ACT_ALLOW, SCMP_ACT_TRAP, scmp_arg_cmp, scmp_compare};
 use serde::{Serialize, Deserialize};
 use bincode::Options;
 use std::os::unix::io::AsRawFd;
@@ -39,7 +39,7 @@ const LIBIRIS_SOCKET_FD_ENV_NAME: &str = "IRIS_SOCK_FD";
 // Chosen to fit MAX_PATH (260 * sizeof(WCHAR)) on Windows + serialization headers.
 const LIBIRIS_IPC_MESSAGE_MAX_SIZE: usize = 1024;
 
-const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 14] = [
+const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 16] = [
     "read",
     "write",
     "readv",
@@ -54,6 +54,8 @@ const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 14] = [
     "restart_syscall",
     "rt_sigreturn",
     "rt_sigaction", // FIXME: should really be handled separately, to hook rt_sigaction(SIGSYS,..)
+    "getpid",
+    "gettid",
 ];
 const DEFAULT_WORKER_STACK_SIZE: usize = 1 * 1024 * 1024;
 
@@ -114,7 +116,7 @@ impl IrisWorker {
                 self.exit_code = Some(libc::WEXITSTATUS(status));
             } else if libc::WIFSIGNALED(status) {
                 println!(" [.] Worker reaped successfully, killed by signal {}", libc::WTERMSIG(status));
-                self.exit_code = Some(libc::WTERMSIG(status));
+                self.exit_code = Some(128 + libc::WTERMSIG(status));
             } else {
                 println!(" [.] Worker reaped successfully, unknown exit reason (status {})", status);
                 self.exit_code = Some(status);
@@ -351,7 +353,15 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
     let syscall_nr = unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] };
 
     // /!\ Memory / print are unsafe in syscall handler, just for debugging purposes here
-    let msg = format!(" [.] Syscall nr={} tried, needs broker proxying\n", syscall_nr);
+    let msg = format!(" [.] Syscall nr={} ({}, {}, {}, {}, {}, {}) tried, needs broker proxying\n",
+        syscall_nr,
+        unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RDI as usize] },
+        unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RSI as usize] },
+        unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RDX as usize] },
+        unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_R10 as usize] },
+        unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_R8 as usize] },
+        unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_R9 as usize] },
+    );
     unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
 
     let mut sock = libiris_get_broker_socket().unwrap();
@@ -379,6 +389,7 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
             };
             unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = return_code; }
         }
+        // TODO: redirect in sigsys handler kill(0), kill(-1) to kill(getpid())
         _ => {
             unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = -(libc::EPERM as i64); }
         }
@@ -442,9 +453,51 @@ pub fn libiris_dont_trust_me_anymore() -> Result<(), String>
         }
     }
 
+    // Add special case handling for kill() on ourselves only (useful for e.g. raise())
+    let syscall_nr = get_syscall_number("kill").unwrap();
+    println!(" [.] Allowing syscall kill / {} on ourselves only", syscall_nr);
+    let mypid = std::process::id();
+    let a0_pid_comparator = scmp_arg_cmp {
+        arg: 0, // first syscall argument
+        op: scmp_compare::SCMP_CMP_EQ,
+        datum_a: mypid.try_into().unwrap(),
+        datum_b: 0, // unused with SCMP_CMP_EQ
+    };
+    let res = unsafe { seccomp_rule_add(filter, SCMP_ACT_ALLOW, syscall_nr, 1, a0_pid_comparator) };
+    if res != 0 {
+        println!(" [!] seccomp_rule_add(SCMP_ACT_ALLOW, kill, SCMP_A0(SCMP_CMP_EQ, getpid())) failed with code {}", -res);
+    }
+
+    let syscall_nr = get_syscall_number("tgkill").unwrap();
+    println!(" [.] Allowing syscall tgkill / {} on ourselves only", syscall_nr);
+    let a0_pid_comparator = scmp_arg_cmp {
+        arg: 0, // first syscall argument
+        op: scmp_compare::SCMP_CMP_EQ,
+        datum_a: mypid.try_into().unwrap(),
+        datum_b: 0, // unused with SCMP_CMP_EQ
+    };
+    let res = unsafe { seccomp_rule_add(filter, SCMP_ACT_ALLOW, syscall_nr, 1, a0_pid_comparator) };
+    if res != 0 {
+        println!(" [!] seccomp_rule_add(SCMP_ACT_ALLOW, tgkill, SCMP_A0(SCMP_CMP_EQ, getpid())) failed with code {}", -res);
+    }
+    
+    let syscall_nr = get_syscall_number("tkill").unwrap();
+    println!(" [.] Allowing syscall tkill / {} on ourselves only", syscall_nr);
+    let mytid = unsafe { libc::syscall(libc::SYS_gettid) };
+    let a0_tid_comparator = scmp_arg_cmp {
+        arg: 0, // first syscall argument
+        op: scmp_compare::SCMP_CMP_EQ,
+        datum_a: mytid.try_into().unwrap(),
+        datum_b: 0, // unused with SCMP_CMP_EQ
+    };
+    let res = unsafe { seccomp_rule_add(filter, SCMP_ACT_ALLOW, syscall_nr, 1, a0_tid_comparator) };
+    if res != 0 {
+        println!(" [!] seccomp_rule_add(SCMP_ACT_ALLOW, tkill, SCMP_A0(SCMP_CMP_EQ, gettid())) failed with code {}", -res);
+    }
+
     let res = unsafe { seccomp_load(filter) };
     if res != 0 {
-        println!(" [!] seccomp_load() failed with error {}", -res);
+        return Err(format!("seccomp_load() failed with error {}", -res));
     }
 
     unsafe { seccomp_release(filter) };
@@ -452,6 +505,4 @@ pub fn libiris_dont_trust_me_anymore() -> Result<(), String>
     println!(" [.] Worker ready to handle untrusted data");
     Ok(())
 }
-
-
 
