@@ -4,7 +4,7 @@ use iris::libiris_worker_new;
 fn execve_errors_propagate() {
     println!(" [.] Broker started");
     match libiris_worker_new("/nonexistentbinary", &["iris-test"], &[]) {
-        Err(e) => (),
+        Err(_) => (),
         Ok(_) => panic!("libiris_worker_new(/nonexistentbinary) succeeded"),
     }
 }

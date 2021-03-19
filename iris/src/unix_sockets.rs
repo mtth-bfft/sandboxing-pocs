@@ -79,7 +79,7 @@ impl UnixSocket {
             msg_namelen: 0,
             msg_iov: &msg_iovec as *const libc::iovec as *mut libc::iovec, // mut is not really used here either
             msg_iovlen: 1,
-            msg_control: cbuf.as_ptr() as *mut c_void, // mut is not used here either (thanks, C)
+            msg_control: cbuf.as_mut_ptr() as *mut c_void,
             msg_controllen: cmsg_space * (if file_descriptor.is_some() { 1 } else { 0 }),
             msg_flags: 0, // unused
         };
