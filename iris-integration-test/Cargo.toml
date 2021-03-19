@@ -32,3 +32,7 @@ path = "src/06_get_exit_code_works_after_termination_worker.rs"
 name = "07_opening_allowed_file_succeeds_worker"
 path = "src/07_opening_allowed_file_succeeds_worker.rs"
 
+[[bin]]
+name = "08_opening_denied_file_fails_worker"
+path = "src/08_opening_denied_file_fails_worker.rs"
+

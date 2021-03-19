@@ -240,7 +240,7 @@ pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<Iri
     if let Ok(bytes) = broker_execve_socket.recvmsg() {
         if bytes.len() > 0 {
             match bincode_options.deserialize::<i32>(&bytes) {
-                Ok(errno) => return Err(format!("Worker execve() failed with error {}", errno)),
+                Ok(errno) => return Err(format!("Worker execve(\"{}\") failed with error {}", exe, errno)),
                 Err(e) => return Err(format!("Worker probably failed to execute, cannot deserialize message from execve socket: {:?}", e)),
             }
         }
