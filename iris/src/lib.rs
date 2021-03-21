@@ -48,7 +48,7 @@ const LIBIRIS_SOCKET_FD_ENV_NAME: &str = "IRIS_SOCK_FD";
 // Chosen to fit MAX_PATH (260 * sizeof(WCHAR)) on Windows + serialization headers.
 const LIBIRIS_IPC_MESSAGE_MAX_SIZE: usize = 1024;
 
-const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 25] = [
+const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 26] = [
     "read",
     "write",
     "readv",
@@ -74,6 +74,7 @@ const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 25] = [
     "arch_prctl",
     "brk",
     "cacheflush",
+    "close_range",
 ];
 const DEFAULT_WORKER_STACK_SIZE: usize = 1 * 1024 * 1024;
 
@@ -545,7 +546,13 @@ pub fn libiris_dont_trust_me_anymore() -> Result<(), String>
     }
 
     for syscall_name in &SYSCALLS_ALLOWED_BY_DEFAULT {
-        let syscall_nr = get_syscall_number(&syscall_name).unwrap();
+        let syscall_nr = match get_syscall_number(&syscall_name) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!(" [.] Unable to find syscall {} : {}", syscall_name, e);
+                continue;
+            },
+        };
         println!(" [.] Allowing syscall {} / {}", syscall_name, syscall_nr);
         let res = unsafe { seccomp_rule_add(filter, SCMP_ACT_ALLOW, syscall_nr, 0) };
         if res != 0 {
