@@ -48,13 +48,18 @@ const LIBIRIS_SOCKET_FD_ENV_NAME: &str = "IRIS_SOCK_FD";
 // Chosen to fit MAX_PATH (260 * sizeof(WCHAR)) on Windows + serialization headers.
 const LIBIRIS_IPC_MESSAGE_MAX_SIZE: usize = 1024;
 
-const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 16] = [
+const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 25] = [
     "read",
     "write",
     "readv",
     "writev",
     "recvmsg",
     "sendmsg",
+    "fstat",
+    "_llseek",
+    "_newselect",
+    "accept",
+    "accept4",
     "close",
     "sigaltstack",
     "munmap",
@@ -65,6 +70,10 @@ const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 16] = [
     "rt_sigaction", // FIXME: should really be handled separately, to hook rt_sigaction(SIGSYS,..)
     "getpid",
     "gettid",
+    "alarm",
+    "arch_prctl",
+    "brk",
+    "cacheflush",
 ];
 const DEFAULT_WORKER_STACK_SIZE: usize = 1 * 1024 * 1024;
 
@@ -401,9 +410,55 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
     );
     unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
 
-
     match syscall_nr {
-        // TODO: open(), openat2(), etc.
+        libc::SYS_bind => {
+        },
+        libc::SYS_access => {
+            
+        },
+        libc::SYS_chdir => {
+            // TODO: emulate in worker, don't let it chdir() anywhere
+        },
+        libc::SYS_stat => {
+            
+        },
+        // TODO: emulate SYS_capset to be a no-op?
+        libc::SYS_capget => {
+            
+        }
+        // TODO: SYS_add_key KEY_SPEC_THREAD_KEYRING, KEY_SPEC_PROCESS_KEYRING
+        // TODO: kill(0), kill(-1) redirect to kill(getpid())
+        // TODO: openat2()
+        libc::SYS_open => {
+            // TODO: resolve the path given relative to CWD if it is relative
+            let path = unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RDI as usize] };
+            let path = unsafe { CStr::from_ptr(path as *const libc::c_char) }.to_owned();
+            let flags = unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RSI as usize] } as i32;
+            println!(" [.] Requesting access to file path {:?}", path);
+            let request = IrisRequest::OpenFile {
+                path: path.to_bytes().to_owned(),
+                read: (flags & (libc::O_WRONLY)) == 0,
+                write: (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0,
+                create: (flags & libc::O_CREAT) != 0,
+                append: (flags & libc::O_APPEND) != 0,
+                truncate: (flags & libc::O_TRUNC) != 0,
+            };
+            let bincode_options = bincode::DefaultOptions::new().with_fixint_encoding();
+            let bytes = match bincode_options.serialize(&request) {
+                Ok(bytes) => bytes,
+                Err(e) => panic!("Failed to serialize syscall request into socket: {:?}", e),
+            };
+            let mut sock = libiris_get_broker_socket().unwrap();
+            sock.sendmsg_with_fd(&bytes, None).expect("Failed to send syscall request to broker");
+            let (bytes, fd) = sock.recvmsg_with_fd().expect("Failed to read response from broker");
+            let return_code = match (bincode_options.deserialize(&bytes), fd) {
+                (Ok(IrisResponse::ReturnCode(0)), Some(fd)) => fd as i64,
+                (Ok(IrisResponse::ReturnCode(n)), None) => -(n as i64),
+                (Ok(IrisResponse::DeniedByPolicy), None) => -(libc::EPERM as i64),
+                err => panic!("Failed to deserialize syscall response: {:?}", err),
+            };
+            unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = return_code; }
+        },
         libc::SYS_openat => {
             // TODO: resolve the file descriptor or CWD if given as argument and path isn't absolute.
             // /!\ readlink(/proc/self/fd/%d) might not be up to date: may have been moved after being opened. Use fstat(fd)?
@@ -435,7 +490,6 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
             };
             unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = return_code; }
         }
-        // TODO: redirect in sigsys handler kill(0), kill(-1) to kill(getpid())
         _ => {
             unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = -(libc::EPERM as i64); }
         }
