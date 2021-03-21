@@ -154,13 +154,25 @@ impl UnixSocket {
         if (msg.msg_flags & libc::MSG_CTRUNC) != 0 {
             return Err("recvmsg() failed due to message including an unexpected ancillary data".to_owned());
         }
-        let cmsghdr = unsafe { libc::CMSG_FIRSTHDR(&msg as *const libc::msghdr) };
-        let fd = unsafe { *(libc::CMSG_DATA(cmsghdr) as *const c_int) };
-        if (msg.msg_flags & libc::MSG_TRUNC) != 0 {
-            unsafe { libc::close(fd) };
-            return Err("recvmsg() failed due to message too long".to_owned());
-        }
+        let fd = if msg.msg_controllen > 0 {
+            let cmsghdr = unsafe { libc::CMSG_FIRSTHDR(&msg as *const libc::msghdr) };
+            if cmsghdr.is_null() {
+                return Err("Failed to parse ancillary data from worker request".to_owned());
+            }
+            if unsafe { (*cmsghdr).cmsg_level } != libc::SOL_SOCKET ||
+               unsafe { (*cmsghdr).cmsg_type } != libc::SCM_RIGHTS {
+                return Err("Unexpected ancillary data received with worker request".to_owned());
+            }
+            let fd = unsafe { *(libc::CMSG_DATA(cmsghdr) as *const c_int) };
+            if (msg.msg_flags & libc::MSG_TRUNC) != 0 {
+                unsafe { libc::close(fd) };
+                return Err("Worker tried to send a message larger than the limit".to_owned());
+            }
+            Some(fd)
+        } else {
+            None
+        };
         buffer.truncate(res.try_into().unwrap());
-        Ok((buffer, Some(fd)))
+        Ok((buffer, fd))
     }
 }

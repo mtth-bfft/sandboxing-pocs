@@ -2,6 +2,7 @@
 
 members = [
     "iris",
+    "iris-policy",
     "iris-integration-test",
     "seccomp-sys",
 ]

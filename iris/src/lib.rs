@@ -11,6 +11,8 @@ use bincode::Options;
 use std::os::unix::io::AsRawFd;
 use std::convert::TryInto;
 
+pub use iris_policy::IrisPolicy;
+
 pub mod broker_sock;
 mod unix_sockets;
 
@@ -20,8 +22,15 @@ use crate::unix_sockets::UnixSocket;
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 enum IrisRequest {
     DontTrustMeAnymore,
-    // path must be a non-null terminated UTF-8 valid string
-    OpenFile { path: Vec<u8>, readonly: bool },
+    // path must be a non-null terminated OS string (not necessarily UTF-8 valid)
+    OpenFile {
+        path: Vec<u8>,
+        read: bool,
+        write: bool,
+        create: bool,
+        append: bool,
+        truncate: bool,
+    },
 }
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 enum IrisResponse {
@@ -93,6 +102,173 @@ impl Drop for IrisWorker {
 }
 
 impl IrisWorker {
+    pub fn new(policy: &IrisPolicy, exe: &str, argv: &[&str], envp: &[&str]) -> Result<Self, String>
+    {
+        if argv.len() < 1 {
+            return Err("Invalid argument passed to IrisWorker::new(): empty argv".to_owned());
+        }
+
+        println!(" [.] Creating worker from PID={}", std::process::id());
+
+        // Allocate a stack for the child to execute on
+        let mut stack = vec![0; DEFAULT_WORKER_STACK_SIZE];
+        let stack_ptr = stack.as_mut_ptr().wrapping_add(DEFAULT_WORKER_STACK_SIZE) as *mut c_void;
+    
+        // Allocate a socketpair for the child to send syscall requests to us
+        let (child_request_socket, mut broker_request_socket) = UnixSocket::new(false)?;
+        // Allocate a socketpair to detect any execve() error during worker startup, using CLOEXEC behaviour on these sockets
+        let (child_execve_socket, mut broker_execve_socket) = UnixSocket::new(true)?;
+    
+        let worker_param = IrisWorkerParam {
+            exe: exe.to_owned(),
+            argv: argv.iter().map(|x| x.to_string()).collect(),
+            envp: envp.iter().map(|x| x.to_string()).collect(),
+            request_socket: child_request_socket,
+            execve_socket: child_execve_socket,
+        };
+    
+        // Unshare as many namespaces as possible
+        // (this might not be possible due to insufficient privilege level,
+        // and/or kernel support for (unprivileged) user namespaces.
+        let clone_args = 0; //libc::CLONE_NEWUSER | libc::CLONE_NEWCGROUP | libc::CLONE_NEWIPC | libc::CLONE_NEWNET | libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWUTS;
+    
+        let worker_param = Box::leak(Box::new(worker_param));
+        let pid = unsafe {
+            libc::clone(worker_entrypoint, stack_ptr, clone_args, worker_param as *const _ as *mut c_void)
+        };
+        if pid <= 0
+        {
+            println!(" [!] Could not create user namespace (not supported by kernel, or not privileged enough)");
+            return Err(format!("clone() failed: {}", Error::last_os_error()));
+        }
+        println!(" [.] Worker process created with PID={}", pid);
+    
+        // Free resources sent to the child process (e.g. close our child's part of socketpairs, which we
+        // won't write to and would otherwise keep the socket opened even after our child dies)
+        let worker_param = unsafe { Box::from_raw(worker_param) };
+        std::mem::drop(worker_param);
+            
+        let bincode_options = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .reject_trailing_bytes()
+            .with_limit(1*1024*1024);
+    
+        if let Ok(bytes) = broker_execve_socket.recvmsg() {
+            if bytes.len() > 0 {
+                match bincode_options.deserialize::<i32>(&bytes) {
+                    Ok(errno) => return Err(format!("Worker execve(\"{}\") failed with error {}", exe, errno)),
+                    Err(e) => return Err(format!("Worker probably failed to execute, cannot deserialize message from execve socket: {:?}", e)),
+                }
+            }
+        }
+    
+        // TODO: if CLONE_NEWNS failed and CAP_SYS_CHROOT is held, chroot to an empty directory
+        // TODO: ensure sandboxed children don't have the (theoretical) right to ptrace() each others (if seccomp fails). Otherwise, prctl(undumpable) like chromium.
+        let policy = policy.clone();
+    
+        let manager_thread_builder = thread::Builder::new().name(format!("iris_{}_manager", pid)).stack_size(32 * 1024);
+        let manager_thread_handle = manager_thread_builder.spawn(move || -> Result<(), String> {
+            let jobs: VecDeque<IrisRequest> = VecDeque::new();
+            let message = match broker_request_socket.recvmsg() {
+                Ok(message) => message,
+                Err(e) => return Err(format!("Failed to read initial request from worker: {:?}, did it exit before calling libiris_dont_trust_me_anymore() ?", e)),
+            };
+            match bincode_options.deserialize(&message) {
+                Ok(IrisRequest::DontTrustMeAnymore) => (),
+                other => return Err(format!("Failed to deserialize initial request from worker: {:?} , did it exit before calling libiris_dont_trust_me_anymore() ?", other)),
+            };
+            let message = bincode_options.serialize(&IrisResponse::YouAreNotTrustworthyAnymore).expect("Failed to serialize initial response");
+    	if let Err(e) = broker_request_socket.sendmsg_with_fd(&message, None) {
+                return Err(format!("Failed to serialize initial response to worker: {:?}, did it exit before calling libiris_dont_trust_me_anymore() ?", e));
+            }
+            loop {
+                let bytes = match broker_request_socket.recvmsg() {
+                    Ok(bytes) => bytes,
+                    Err(e) => return Err(format!("Failed to read request from worker: {}", e)),
+                };
+                if bytes.is_empty() {
+                    break;
+                }
+                let request: IrisRequest = match bincode_options.deserialize(&bytes) {
+                    Ok(r) => r,
+                    Err(e) => return Err(format!("Failed to deserialize request from worker: {}", e)),
+                };
+                println!(" [.] Received request from worker: {:?}", request);
+                let (response, fd) = match request {
+                    IrisRequest::OpenFile { path, read, write, create, append, truncate } => {
+                        let path_nul = match CString::new(path) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                println!(" [!] Worker requested open() of invalid path ({})", e);
+                                break;
+                            },
+                        };
+                        let mut flags = match (read, write) {
+                            (true, true) => libc::O_RDWR,
+                            (true, false) => libc::O_RDONLY,
+                            (false, true) => libc::O_WRONLY,
+                            _ => {
+                                println!(" [!] Worker requested open({:?}) with no read nor write", path_nul);
+                                break;
+                            },
+                        };
+                        if create {
+                            flags |= libc::O_CREAT;
+                        }
+                        if append {
+                            flags |= libc::O_APPEND;
+                        }
+                        if truncate {
+                            flags |= libc::O_TRUNC;
+                        }
+                        if (read && !policy.is_file_path_allowed_for_read(&path_nul)) ||
+                           ((write || append || create || truncate) && !policy.is_file_path_allowed_for_write(&path_nul))
+                        {
+                            println!(" [!] Denied by policy");
+                            (IrisResponse::DeniedByPolicy, None)
+                        }
+                        else {
+                            let res = unsafe { libc::open(path_nul.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0) };
+                            if res < 0 {
+                                println!(" [!] Worker requested open({:?}) which failed with error {}", path_nul, res);
+                                (IrisResponse::ReturnCode(res.try_into().unwrap()), None)
+                            }
+                            else {
+                                println!(" [.] Granted, sending file descriptor");
+                                (IrisResponse::ReturnCode(0), Some(res))
+                            }
+                        }
+                    },
+                    _ => {
+                        println!(" [!] Discarding unexpected request from worker: {:?}", request);
+                        (IrisResponse::UnexpectedRequest, None)
+                    },
+                };
+                let bytes = match bincode_options.serialize(&response) {
+                    Ok(bytes) => bytes,
+                    Err(e) => return Err(format!("Failed to serialize response for worker: {}", e)),
+                };
+                if let Err(e) = broker_request_socket.sendmsg_with_fd(&bytes, fd) {
+                    return Err(format!("Failed to send response to worker: {}", e));
+                }
+            }
+            println!(" [.] Worker closed its side of the communication socket, manager closing");
+            Ok(())
+        });
+        
+        let manager_thread_handle = match manager_thread_handle {
+            Ok(handle) => handle,
+            Err(e) => return Err(format!("Unable to spawn thread to manage the worker's lifetime: {}", e)),
+        };
+        
+        Ok(IrisWorker {
+            pid: pid as u64,
+            initial_thread_stack: stack,
+            manager_thread_handle: Some(manager_thread_handle),
+            exit_code: None,
+        })
+    }
+
     pub fn wait_for_exit(&mut self) -> Result<(), String> {
         if let Some(handle) = self.manager_thread_handle.take() {
             println!(" [.] Waiting for manager thread to exit");
@@ -127,9 +303,11 @@ impl IrisWorker {
         }
         Ok(())
     }
+
     pub fn has_exited(&self) -> bool {
         self.manager_thread_handle.is_none() || self.exit_code.is_some()
     }
+
     pub fn get_exit_code(&self) -> Option<i32> {
         self.exit_code
     }
@@ -186,147 +364,6 @@ extern "C" fn worker_entrypoint(arg: *mut c_void) -> c_int
 }
 
 
-pub fn libiris_worker_new(exe: &str, argv: &[&str], envp: &[&str]) -> Result<IrisWorker, String>
-{
-    if argv.len() < 1 {
-        return Err("Invalid argument passed to libiris_worker_new(): empty argv".to_owned());
-    }
-
-    println!(" [.] Creating worker from PID={}", std::process::id());
-
-    // Allocate a stack for the child to execute on
-    let mut stack = vec![0; DEFAULT_WORKER_STACK_SIZE];
-    let stack_ptr = stack.as_mut_ptr().wrapping_add(DEFAULT_WORKER_STACK_SIZE) as *mut c_void;
-
-    // Allocate a socketpair for the child to send syscall requests to us
-    let (child_request_socket, mut broker_request_socket) = UnixSocket::new(false)?;
-    // Allocate a socketpair to detect any execve() error during worker startup, using CLOEXEC behaviour on these sockets
-    let (child_execve_socket, mut broker_execve_socket) = UnixSocket::new(true)?;
-
-    let worker_param = IrisWorkerParam {
-        exe: exe.to_owned(),
-        argv: argv.iter().map(|x| x.to_string()).collect(),
-        envp: envp.iter().map(|x| x.to_string()).collect(),
-        request_socket: child_request_socket,
-        execve_socket: child_execve_socket,
-    };
-
-    // Unshare as many namespaces as possible
-    // (this might not be possible due to insufficient privilege level,
-    // and/or kernel support for (unprivileged) user namespaces.
-    let clone_args = 0; //libc::CLONE_NEWUSER | libc::CLONE_NEWCGROUP | libc::CLONE_NEWIPC | libc::CLONE_NEWNET | libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWUTS;
-
-    let worker_param = Box::leak(Box::new(worker_param));
-    let pid = unsafe {
-        libc::clone(worker_entrypoint, stack_ptr, clone_args, worker_param as *const _ as *mut c_void)
-    };
-    if pid <= 0
-    {
-        println!(" [!] Could not create user namespace (not supported by kernel, or not privileged enough)");
-        return Err(format!("clone() failed: {}", Error::last_os_error()));
-    }
-    println!(" [.] Worker process created with PID={}", pid);
-
-    // Free resources sent to the child process (e.g. close our child's part of socketpairs, which we
-    // won't write to and would otherwise keep the socket opened even after our child dies)
-    let worker_param = unsafe { Box::from_raw(worker_param) };
-    std::mem::drop(worker_param);
-        
-    let bincode_options = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .reject_trailing_bytes()
-        .with_limit(1*1024*1024);
-
-    if let Ok(bytes) = broker_execve_socket.recvmsg() {
-        if bytes.len() > 0 {
-            match bincode_options.deserialize::<i32>(&bytes) {
-                Ok(errno) => return Err(format!("Worker execve(\"{}\") failed with error {}", exe, errno)),
-                Err(e) => return Err(format!("Worker probably failed to execute, cannot deserialize message from execve socket: {:?}", e)),
-            }
-        }
-    }
-
-    // TODO: if CLONE_NEWNS failed and CAP_SYS_CHROOT is held, chroot to an empty directory
-    // TODO: ensure sandboxed children don't have the (theoretical) right to ptrace() each others (if seccomp fails). Otherwise, prctl(undumpable) like chromium.
-
-    let manager_thread_builder = thread::Builder::new().name(format!("iris_{}_manager", pid)).stack_size(32 * 1024);
-    let manager_thread_handle = manager_thread_builder.spawn(move || -> Result<(), String> {
-        let jobs: VecDeque<IrisRequest> = VecDeque::new();
-        let message = match broker_request_socket.recvmsg() {
-            Ok(message) => message,
-            Err(e) => return Err(format!("Failed to read initial request from worker: {:?}, did it exit before calling libiris_dont_trust_me_anymore() ?", e)),
-        };
-        match bincode_options.deserialize(&message) {
-            Ok(IrisRequest::DontTrustMeAnymore) => (),
-            other => return Err(format!("Failed to deserialize initial request from worker: {:?} , did it exit before calling libiris_dont_trust_me_anymore() ?", other)),
-        };
-        let message = bincode_options.serialize(&IrisResponse::YouAreNotTrustworthyAnymore).expect("Failed to serialize initial response");
-	if let Err(e) = broker_request_socket.sendmsg_with_fd(&message, None) {
-            return Err(format!("Failed to serialize initial response to worker: {:?}, did it exit before calling libiris_dont_trust_me_anymore() ?", e));
-        }
-        loop {
-            let bytes = match broker_request_socket.recvmsg() {
-                Ok(bytes) => bytes,
-                Err(e) => return Err(format!("Failed to read request from worker: {}", e)),
-            };
-            if bytes.is_empty() {
-                break;
-            }
-            println!(" [+] Received from worker: {:?}", &bytes);
-            let request: IrisRequest = match bincode_options.deserialize(&bytes) {
-                Ok(r) => r,
-                Err(e) => return Err(format!("Failed to deserialize request from worker: {}", e)),
-            };
-            println!(" [.] Received request from worker: {:?}", request);
-            let (response, fd) = match request {
-                IrisRequest::OpenFile { path, readonly } => {
-                    let path_nul = match CString::new(path) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            println!(" [!] Worker requested open() of invalid path ({}), probably malicious", e);
-                            break;
-                        },
-                    };
-                    let perms = if readonly { libc::O_RDONLY } else { libc::O_RDWR };
-                    let res = unsafe { libc::open(path_nul.as_ptr(), perms | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0) };
-                    if res < 0 {
-                        println!(" [!] Worker requested open({:?}) which failed with error {}", path_nul, res);
-                        (IrisResponse::ReturnCode(res.try_into().unwrap()), None)
-                    }
-                    else {
-                        (IrisResponse::ReturnCode(0), Some(res))
-                    }
-                },
-                _ => {
-                    println!(" [!] Discarding unexpected request from worker: {:?}", request);
-                    (IrisResponse::UnexpectedRequest, None)
-                },
-            };
-            let bytes = match bincode_options.serialize(&response) {
-                Ok(bytes) => bytes,
-                Err(e) => return Err(format!("Failed to serialize response for worker: {}", e)),
-            };
-            if let Err(e) = broker_request_socket.sendmsg_with_fd(&bytes, fd) {
-                return Err(format!("Failed to send response to worker: {}", e));
-            }
-        }
-        println!(" [.] Worker closed its side of the communication socket, manager closing");
-        Ok(())
-    });
-    
-    let manager_thread_handle = match manager_thread_handle {
-        Ok(handle) => handle,
-        Err(e) => return Err(format!("Unable to spawn thread to manage the worker's lifetime: {}", e)),
-    };
-    
-    Ok(IrisWorker {
-        pid: pid as u64,
-        initial_thread_stack: stack,
-        manager_thread_handle: Some(manager_thread_handle),
-        exit_code: None,
-    })
-}
-
 fn get_syscall_number(name: &str) -> Result<i32, String>
 {
     let name_null_terminated = CString::new(name).unwrap();
@@ -364,27 +401,36 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
     );
     unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
 
-    let mut sock = libiris_get_broker_socket().unwrap();
-    let bincode_options = bincode::DefaultOptions::new().with_fixint_encoding();
 
     match syscall_nr {
+        // TODO: open(), openat2(), etc.
         libc::SYS_openat => {
+            // TODO: resolve the file descriptor or CWD if given as argument and path isn't absolute.
+            // /!\ readlink(/proc/self/fd/%d) might not be up to date: may have been moved after being opened. Use fstat(fd)?
             let path = unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RSI as usize] };
+            let flags = unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RDX as usize] } as i32;
             let path = unsafe { CStr::from_ptr(path as *const libc::c_char) }.to_owned();
             println!(" [.] Requesting access to file path {:?}", path);
             let request = IrisRequest::OpenFile {
                 path: path.to_bytes().to_owned(),
-                readonly: true,
+                read: (flags & (libc::O_WRONLY)) == 0,
+                write: (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0,
+                create: (flags & libc::O_CREAT) != 0,
+                append: (flags & libc::O_APPEND) != 0,
+                truncate: (flags & libc::O_TRUNC) != 0,
             };
+            let bincode_options = bincode::DefaultOptions::new().with_fixint_encoding();
             let bytes = match bincode_options.serialize(&request) {
                 Ok(bytes) => bytes,
                 Err(e) => panic!("Failed to serialize syscall request into socket: {:?}", e),
             };
+            let mut sock = libiris_get_broker_socket().unwrap();
             sock.sendmsg_with_fd(&bytes, None).expect("Failed to send syscall request to broker");
             let (bytes, fd) = sock.recvmsg_with_fd().expect("Failed to read response from broker");
             let return_code = match (bincode_options.deserialize(&bytes), fd) {
                 (Ok(IrisResponse::ReturnCode(0)), Some(fd)) => fd as i64,
                 (Ok(IrisResponse::ReturnCode(n)), None) => -(n as i64),
+                (Ok(IrisResponse::DeniedByPolicy), None) => -(libc::EPERM as i64),
                 err => panic!("Failed to deserialize syscall response: {:?}", err),
             };
             unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = return_code; }
