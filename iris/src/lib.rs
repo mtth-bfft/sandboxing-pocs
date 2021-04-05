@@ -64,19 +64,23 @@ const LIBIRIS_SOCKET_FD_ENV_NAME: &str = "IRIS_SOCK_FD";
 // Chosen to fit MAX_PATH (260 * sizeof(WCHAR)) on Windows + serialization headers.
 const LIBIRIS_IPC_MESSAGE_MAX_SIZE: usize = 1024;
 
-const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 26] = [
+const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 53] = [
     "read",
     "write",
     "readv",
     "writev",
     "recvmsg",
     "sendmsg",
+    "tee",
     "fstat",
     "_llseek",
+    "select",
     "_newselect",
     "accept",
     "accept4",
+    "ftruncate",
     "close",
+    "memfd_create",
     "sigaltstack",
     "munmap",
     "nanosleep",
@@ -91,6 +95,29 @@ const SYSCALLS_ALLOWED_BY_DEFAULT: [&str; 26] = [
     "brk",
     "cacheflush",
     "close_range",
+    "getresuid",
+    "getresgid",
+    "getresuid32",
+    "getresgid32",
+    "getrandom",
+    "getuid",
+    "getuid32",
+    "readdir",
+    "timer_create",
+    "timer_delete",
+    "timer_getoverrun",
+    "timer_gettime",
+    "timer_settime",
+    "timerfd_create",
+    "timerfd_gettime",
+    "timerfd_settime",
+    "times",
+    "sched_yield",
+    "time",
+    "uname",
+    "shutdown",
+    "nice",
+    "pause",
 ];
 const DEFAULT_WORKER_STACK_SIZE: usize = 1 * 1024 * 1024;
 
@@ -528,12 +555,18 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
         },
         // TODO: emulate SYS_capset to be a no-op?
         libc::SYS_capget => {
-            
+            // TODO: limit on broker side hdrp->pid == worker->pid (otherwise, allows leaking info about non-sandboxed processes
         }
 */
         // TODO: SYS_add_key KEY_SPEC_THREAD_KEYRING, KEY_SPEC_PROCESS_KEYRING
-        // TODO: kill(0), kill(-1) redirect to kill(getpid())
+        // TODO: kill(): redirect 0 and -1 to getpid() and restart syscall, brokerize others with dedicated IrisRequest::SendSignal(pid, sig)
         // TODO: openat2()
+        // TODO: chown()
+        // TODO: lchown()
+        // TODO: lchown32()
+        // TODO: mkdir()
+        // TODO: truncate(), truncate64()
+        // TODO: socket(), bind(), listen(), accept()
         libc::SYS_open => {
             // TODO: resolve the path given relative to CWD if it is relative
             let path = unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RDI as usize] };
