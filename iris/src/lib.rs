@@ -1,8 +1,8 @@
 use std::io::Error;
 use std::thread;
-use std::ffi::{CString, CStr};
+use std::ffi::{CString, CStr, OsStr};
+use std::os::unix::ffi::OsStrExt;
 use std::collections::VecDeque;
-use core::sync::atomic::AtomicBool;
 use libc::{c_void, c_int};
 use core::ptr::null;
 use seccomp_sys::{seccomp_init, seccomp_attr_set, seccomp_syscall_resolve_name, seccomp_rule_add, seccomp_load, seccomp_release, scmp_filter_attr, __NR_SCMP_ERROR, SCMP_ACT_ALLOW, SCMP_ACT_TRAP, scmp_arg_cmp, scmp_compare};
@@ -19,7 +19,7 @@ mod unix_sockets;
 use crate::broker_sock::libiris_get_broker_socket;
 use crate::unix_sockets::UnixSocket;
 
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq)]
 enum IrisRequest {
     DontTrustMeAnymore,
     // path must be a non-null terminated OS string (not necessarily UTF-8 valid)
@@ -32,6 +32,22 @@ enum IrisRequest {
         truncate: bool,
     },
 }
+
+impl std::fmt::Debug for IrisRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IrisRequest::DontTrustMeAnymore => write!(f, "DontTrustMeAnymore"),
+            IrisRequest::OpenFile { path, read, write, create, append, truncate } => write!(f,
+                "OpenFile({}{}{}{}{}{})", OsStr::from_bytes(&path[..]).to_string_lossy(),
+                if *read { ", read" } else { "" },
+                if *write { ", write" } else { "" },
+                if *create { ", create" } else { "" },
+                if *append { ", append" } else { "" },
+                if *truncate { ", truncate" } else { "" }),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 enum IrisResponse {
     YouAreNotTrustworthyAnymore,
@@ -203,7 +219,6 @@ impl IrisWorker {
                     Ok(r) => r,
                     Err(e) => return Err(format!("Failed to deserialize request from worker: {}", e)),
                 };
-                println!(" [.] Received request from worker: {:?}", request);
                 let (response, fd) = match request {
                     IrisRequest::OpenFile { path, read, write, create, append, truncate } => {
                         let path_nul = match CString::new(path) {
@@ -234,14 +249,14 @@ impl IrisWorker {
                         if (read && !policy.is_file_path_allowed_for_read(&path_nul)) ||
                            ((write || append || create || truncate) && !policy.is_file_path_allowed_for_write(&path_nul))
                         {
-                            println!(" [!] Denied by policy");
                             (IrisResponse::DeniedByPolicy, None)
                         }
                         else {
                             let res = unsafe { libc::open(path_nul.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0) };
                             if res < 0 {
-                                println!(" [!] Worker requested open({:?}) which failed with error {}", path_nul, res);
-                                (IrisResponse::ReturnCode(res.try_into().unwrap()), None)
+                                println!(" [!] Worker requested open({:?}, {}) which failed with error {}", path_nul, flags, res);
+                                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
+                                (IrisResponse::ReturnCode(errno.try_into().unwrap()), None)
                             }
                             else {
                                 println!(" [.] Granted, sending file descriptor");
@@ -384,7 +399,18 @@ fn get_syscall_number(name: &str) -> Result<i32, String>
     Ok(nr)
 }
 
-thread_local!(static SIGSYS_HANDLER_ALREADY_RUNNING: AtomicBool = AtomicBool::new(false));
+fn get_response_from_broker(request: IrisRequest, fd: Option<i32>) -> (IrisResponse, Option<i32>)
+{
+    let bincode_options = bincode::DefaultOptions::new().with_fixint_encoding();
+    let mut sock = libiris_get_broker_socket().unwrap();
+    let bytes = bincode_options.serialize(&request).expect("Failed to serialize request for broker");
+    println!(" [.] Sending request to broker: {:?}", &request);
+    sock.sendmsg_with_fd(&bytes, fd).expect("Failed to send syscall request to broker");
+    let (bytes, fd) = sock.recvmsg_with_fd().expect("Failed to read response from broker");
+    let response = bincode_options.deserialize(&bytes).expect("Failed to deserialize response from broker");
+    println!(" [.] Received response from broker: {:?}", &response);
+    (response, fd)
+}
 
 extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, ucontext: *const c_void)
 {
@@ -411,14 +437,91 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
     );
     unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
 
-    match syscall_nr {
-        libc::SYS_bind => {
-        },
+    let response_code = match syscall_nr {
         libc::SYS_access => {
-            
+            let path = unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RDI as usize] };
+            let path = unsafe { CStr::from_ptr(path as *const libc::c_char) }.to_owned();
+            let mode = unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RSI as usize] } as i32;
+            println!(" [.] access({:?}, {}) called", path, mode);
+            if mode == libc::F_OK {
+                let request = IrisRequest::OpenFile {
+                    path: path.to_bytes().to_owned(),
+                    read: true,
+                    write: false,
+                    create: false,
+                    append: false,
+                    truncate: false,
+                };
+                match get_response_from_broker(request, None) {
+                    (IrisResponse::ReturnCode(0), Some(fd)) => {
+                        unsafe { libc::close(fd); }
+                        0
+                    },
+                    (IrisResponse::ReturnCode(n), None) if n != libc::EACCES.try_into().unwrap() => -(n as i64),
+                    (IrisResponse::ReturnCode(_), None) | (IrisResponse::DeniedByPolicy, None) => {
+                        // Retry with write-only access
+                        let request = IrisRequest::OpenFile {
+                            path: path.to_bytes().to_owned(),
+                            read: false,
+                            write: true,
+                            create: false,
+                            append: false,
+                            truncate: false,
+                        };
+                        match get_response_from_broker(request, None) {
+                            (IrisResponse::ReturnCode(0), Some(fd)) => {
+                                unsafe { libc::close(fd); }
+                                0
+                            },
+                            (IrisResponse::ReturnCode(n), None) => -(n as i64),
+                            (IrisResponse::DeniedByPolicy, None) => -(libc::EACCES as i64),
+                            err => panic!("Unexpected broker response: {:?}", err),
+                        }
+                    },
+                    err => panic!("Unexpected broker response: {:?}", err),
+                }
+            }
+            else {
+                let request = IrisRequest::OpenFile {
+                    path: path.to_bytes().to_owned(),
+                    read: (mode & (libc::R_OK | libc::X_OK)) != 0,
+                    write: (mode & libc::W_OK) != 0,
+                    create: false,
+                    append: false,
+                    truncate: false,
+                };
+                match get_response_from_broker(request, None) {
+                    (IrisResponse::ReturnCode(0), Some(fd)) => {
+                        unsafe { libc::close(fd); }
+                        0
+                    },
+                    (IrisResponse::ReturnCode(n), None) if n != libc::EACCES.try_into().unwrap() => -(n as i64),
+                    (IrisResponse::ReturnCode(_), None) | (IrisResponse::DeniedByPolicy, None) => -(libc::EACCES as i64),
+                    err => panic!("Unexpected broker response: {:?}", err),
+                }
+            }
+        },
+/*
+        libc::SYS_bind => {
         },
         libc::SYS_chdir => {
             // TODO: emulate in worker, don't let it chdir() anywhere
+        },
+        libc::SYS_chmod => {
+        },
+        libc::SYS_chown => {
+        },
+//        libc::SYS_chown32 => {
+//        },
+        libc::SYS_connect => {
+        },
+        libc::SYS_creat => {
+        },
+        libc::SYS_faccessat => {
+        },
+//        libc::SYS_faccessat2 => {
+//        },
+        libc::SYS_fchdir => {
         },
         libc::SYS_stat => {
             
@@ -427,6 +530,7 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
         libc::SYS_capget => {
             
         }
+*/
         // TODO: SYS_add_key KEY_SPEC_THREAD_KEYRING, KEY_SPEC_PROCESS_KEYRING
         // TODO: kill(0), kill(-1) redirect to kill(getpid())
         // TODO: openat2()
@@ -458,7 +562,7 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
                 (Ok(IrisResponse::DeniedByPolicy), None) => -(libc::EPERM as i64),
                 err => panic!("Failed to deserialize syscall response: {:?}", err),
             };
-            unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = return_code; }
+            return_code
         },
         libc::SYS_openat => {
             // TODO: resolve the file descriptor or CWD if given as argument and path isn't absolute.
@@ -489,12 +593,15 @@ extern "C" fn sigsys_handler(signal_no: c_int, siginfo: *const libc::siginfo_t, 
                 (Ok(IrisResponse::DeniedByPolicy), None) => -(libc::EPERM as i64),
                 err => panic!("Failed to deserialize syscall response: {:?}", err),
             };
-            unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = return_code; }
+            return_code
         }
         _ => {
-            unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = -(libc::EPERM as i64); }
+            println!(" [!] Syscall not supported yet, denied by default");
+            -(libc::EPERM as i64)
         }
-    }
+    };
+    println!(" [.] Syscall result: {}", response_code);
+    unsafe { (*ucontext).uc_mcontext.gregs[libc::REG_RAX as usize] = response_code; }
 }
 
 pub fn libiris_dont_trust_me_anymore() -> Result<(), String>

@@ -36,3 +36,7 @@ path = "src/07_opening_allowed_file_succeeds_worker.rs"
 name = "08_opening_denied_file_fails_worker"
 path = "src/08_opening_denied_file_fails_worker.rs"
 
+[[bin]]
+name = "09_access_worker"
+path = "src/09_access_worker.rs"
+
